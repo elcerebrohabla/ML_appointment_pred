@@ -1,0 +1,592 @@
+import numpy as np
+import pandas as pd
+from sqlalchemy import create_engine
+
+from scipy import stats
+from scipy.stats import skew
+from scipy.special import boxcox1p
+from scipy.stats import boxcox_normmax
+
+from sklearn.svm import SVR
+from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.impute import SimpleImputer
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.tree import DecisionTreeRegressor, DecisionTreeClassifier
+import xgboost as xgb
+from xgboost import XGBRegressor, XGBClassifier
+from catboost import CatBoostClassifier
+from sklearn.metrics import accuracy_score, confusion_matrix, mean_squared_error, r2_score, mean_absolute_error, precision_score, recall_score, f1_score, roc_auc_score
+from sklearn.model_selection import GridSearchCV, RandomizedSearchCV, train_test_split, StratifiedKFold
+from sklearn.preprocessing import OrdinalEncoder, StandardScaler, LabelEncoder, RobustScaler
+
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense
+from scikeras.wrappers import KerasClassifier
+
+import joblib
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+%matplotlib inline
+import warnings
+warnings.filterwarnings("ignore")
+sns.set(style="darkgrid",font_scale=1.5)
+pd.set_option('display.max_columns', None)
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+file_path = '/content/drive/My Drive/bases/***.csv'
+file_path_b = '/content/drive/My Drive/bases/***.csv'
+
+
+# Lee el archivo usando pandas
+base = pd.read_csv(file_path)
+db_predict = pd.read_csv(file_path_b)
+
+#Para no tener que estarla recargando del servidor, ejecutar esta si se necesita la base original
+db = base
+
+
+
+# Suponiendo que el DataFrame db ya está cargado y contiene los datos
+
+# Crear variable binaria
+db = db[(db['tipo'] == 'Cita finalizada') |
+        (db['tipo'] == 'Cita creada') |
+        (db['tipo'] == 'Cita confirmada') |
+        (db['tipo'] == 'Cita confirmada por paciente') |
+        (db['tipo'] == 'Cancelar - paciente cancelo') |
+        (db['tipo'] == 'Cancelar - paciente no llego')]
+
+db['Cita exitosa'] = np.where(db['tipo'].isin(["Cita finalizada",
+                                                 "Cita creada",
+                                                 "Cita confirmada",
+                                                 "Cita confirmada por paciente"]), 1, 0)
+
+# Convertir a formato fecha
+db['start_time'] = pd.to_datetime(db['start_time'], errors='coerce')
+
+# Seleccionar clínica. Dejar comentado en caso de que se use toda la base
+#db = db[db['nombre_clinica'] == "VITALEZA"]
+
+# Extraer fecha, hora y día
+db['mes'] = db['start_time'].dt.month
+db['hora'] = db['start_time'].dt.hour
+db['día'] = db['start_time'].dt.day_name()
+
+# Número de citas
+db = db.sort_values(by=['patient_id', 'start_time'])
+db['Número cita'] = db.groupby('patient_id').cumcount() + 1
+
+# Estaciones del año
+def get_season(date):
+    if (date.month == 3 and date.day >= 20) or (date.month == 4) or (date.month == 5) or (date.month == 6 and date.day < 21):
+        return 'Primavera'
+    elif (date.month == 6 and date.day >= 21) or (date.month == 7) or (date.month == 8) or (date.month == 9 and date.day < 22):
+        return 'Verano'
+    elif (date.month == 9 and date.day >= 22) or (date.month == 10) or (date.month == 11) or (date.month == 12 and date.day < 21):
+        return 'Otoño'
+    else:
+        return 'Invierno'
+
+db['estacion'] = db['start_time'].apply(get_season)
+
+# Excluir horas donde casi no hay citas
+db = db[(db['hora'] > 6) & (db['hora'] < 24)]
+
+# Días de diferencia
+db = db[db['date'] != '0000-00-00']
+db = db[db['created'] != '0000-00-00']
+
+db['date'] = pd.to_datetime(db['date'],  errors='coerce')
+db['created'] = pd.to_datetime(db['created'],  errors='coerce')
+
+db = db[db['date'] != '0000-00-00']
+db = db[db['created'] != '0000-00-00']
+
+db['diferencia'] = db['date'] - db['created']
+db['diferencia'] = db['diferencia'].dt.days
+
+# Sexo en binario
+db['Sexo'] = np.where(db['sex'].isin(["m"]), 1, 0)
+
+# Edad en bins
+db['Edad'] = pd.to_numeric(db['Edad'], errors='coerce')
+db = db[db['Edad'] < 100]
+
+# Función para crear bins de edad
+def create_age_bins(df, num_bins=10):
+    age_bin_edges = np.linspace(start=0, stop=df['Edad'].max(), num=num_bins + 1).astype(int)
+    age_bin_labels = ["{}_to_{}".format(age_bin_edges[i], age_bin_edges[i + 1]) for i in range(len(age_bin_edges) - 1)]
+    df['Edad_bin'] = pd.cut(df['Edad'], bins=age_bin_edges, labels=age_bin_labels)
+    return df, age_bin_edges, age_bin_labels
+
+# Aplicar a los datos de entrenamiento
+db, age_bin_edges, age_bin_labels = create_age_bins(db)
+
+# Guardar los bins y etiquetas de edad
+joblib.dump((age_bin_edges, age_bin_labels), 'age_bins.joblib')
+
+# Calcular la tasa de no asistencia previa
+db['tasa_no_asistencia_previa'] = 0.0
+
+# Calcular la tasa de no asistencia previa para cada paciente
+for patient_id, group in db.groupby('patient_id'):
+    citas_totales = 0
+    no_asistencias = 0
+    tasas = []
+    for index, row in group.iterrows():
+        if citas_totales > 0:
+            tasa_no_asistencia = no_asistencias / citas_totales
+        else:
+            tasa_no_asistencia = 0
+        tasas.append(tasa_no_asistencia)
+
+        citas_totales += 1
+        if row['Cita exitosa'] == 0:
+            no_asistencias += 1
+
+    db.loc[group.index, 'tasa_no_asistencia_previa'] = tasas
+
+
+
+
+# Seleccionar columnas de interés
+db = db[['servicio', 'día', 'hora', 'mes', 'Sexo', 'Edad_bin', 'Número cita', 'Cita exitosa', 'diferencia', 'estacion', 'Doctor']]
+
+# Remover drop na
+db = db.dropna()
+
+# Convertir variables categóricas a variables dummy
+cols = db.select_dtypes(include=['object', 'category']).columns
+db = pd.get_dummies(db, columns=cols)
+
+# Añadir codificación cíclica para hora y mes
+db['hora_sin'] = np.sin(2 * np.pi * db['hora'] / 24.0)
+db['hora_cos'] = np.cos(2 * np.pi * db['hora'] / 24.0)
+db['mes_sin'] = np.sin(2 * np.pi * db['mes'] / 12.0)
+db['mes_cos'] = np.cos(2 * np.pi * db['mes'] / 12.0)
+
+# Dividir datos en características (X) y etiqueta (y)
+X = db.drop(columns=["Cita exitosa"])
+y = db["Cita exitosa"]
+
+# Escalar las características
+scaler = RobustScaler()
+X_scaled = scaler.fit_transform(X)
+
+# Dividir los datos en conjuntos de entrenamiento y prueba
+x_train, x_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=0)
+
+# Guardar el escalador
+joblib.dump(scaler, 'scaler.joblib')
+
+# Entrenar el modelo XGBoost con búsqueda de hiperparámetros
+parameters = {
+    'n_estimators': [50, 100, 150, 200],
+    'max_depth': [3, 4, 5, 6, 7],
+    'learning_rate': [0.01, 0.05, 0.1, 0.2],
+    'subsample': [0.6, 0.7, 0.8, 0.9, 1.0],
+    'colsample_bytree': [0.6, 0.7, 0.8, 0.9, 1.0],
+    'gamma': [0, 0.1, 0.2, 0.3, 0.4],
+    'min_child_weight': [1, 3, 5, 7],
+    'reg_alpha': [0, 0.01, 0.1, 1],
+    'reg_lambda': [0.1, 1, 1.5, 2, 3]
+}
+
+clf = xgb.XGBClassifier(objective='binary:logistic')
+
+grid_search = RandomizedSearchCV(clf, parameters, scoring='accuracy', cv=4, verbose=3, n_jobs=-1)
+grid_search.fit(x_train, y_train)
+
+best_parameters2 = grid_search.best_params_
+
+# Entrenar el modelo XGBoost con los mejores hiperparámetros
+XGB_model = XGBClassifier(**best_parameters2)
+XGB_model.fit(x_train, y_train)
+
+db.head()
+
+# Obtener las probabilidades de la clase positiva
+y_prob = XGB_model.predict_proba(x_test)[:, 1]
+
+# Definir una función para evaluar el rendimiento en diferentes umbrales
+def evaluate_threshold(y_true, y_prob, threshold):
+    y_pred = (y_prob >= threshold).astype(int)
+    precision = precision_score(y_true, y_pred)
+    recall = recall_score(y_true, y_pred)
+    f1 = f1_score(y_true, y_pred)
+    accuracy = accuracy_score(y_true, y_pred)
+    roc_auc = roc_auc_score(y_true, y_prob)
+    return precision, recall, f1, accuracy, roc_auc
+
+# Evaluar el modelo en diferentes umbrales
+thresholds = np.arange(0.0, 1.1, 0.1)
+metrics = {'Threshold': [], 'Precision': [], 'Recall': [], 'F1 Score': [], 'Accuracy': [], 'ROC AUC': []}
+
+for threshold in thresholds:
+    precision, recall, f1, accuracy, roc_auc = evaluate_threshold(y_test, y_prob, threshold)
+    metrics['Threshold'].append(threshold)
+    metrics['Precision'].append(precision)
+    metrics['Recall'].append(recall)
+    metrics['F1 Score'].append(f1)
+    metrics['Accuracy'].append(accuracy)
+    metrics['ROC AUC'].append(roc_auc)
+
+# Convertir las métricas en un DataFrame para facilitar la visualización
+metrics_df = pd.DataFrame(metrics)
+
+# Imprimir las métricas
+print(metrics_df)
+
+# Graficar las métricas
+plt.figure(figsize=(12, 8))
+plt.plot(metrics_df['Threshold'], metrics_df['Precision'], label='Precision')
+plt.plot(metrics_df['Threshold'], metrics_df['Recall'], label='Recall')
+plt.plot(metrics_df['Threshold'], metrics_df['F1 Score'], label='F1 Score')
+plt.plot(metrics_df['Threshold'], metrics_df['Accuracy'], label='Accuracy')
+plt.xlabel('Threshold')
+plt.ylabel('Score')
+plt.title('Metric Scores for Different Thresholds')
+plt.legend()
+plt.show()
+
+# Seleccionar el mejor umbral basado en la métrica de interés (por ejemplo, F1 Score)
+best_threshold = thresholds[np.argmax(metrics_df['F1 Score'])]
+print(f'Mejor Umbral basado en F1 Score: {best_threshold}')
+
+# Aplicar el mejor umbral y obtener las métricas finales
+y_pred_best = (y_prob >= best_threshold).astype(int)
+final_precision = precision_score(y_test, y_pred_best)
+final_recall = recall_score(y_test, y_pred_best)
+final_f1 = f1_score(y_test, y_pred_best)
+final_accuracy = accuracy_score(y_test, y_pred_best)
+final_roc_auc = roc_auc_score(y_test, y_prob)
+
+print(f'Precision: {final_precision}')
+print(f'Recall: {final_recall}')
+print(f'F1 Score: {final_f1}')
+print(f'Accuracy: {final_accuracy}')
+print(f'ROC AUC: {final_roc_auc}')
+
+# Guardar el modelo
+joblib.dump(XGB_model, 'XGB_model.xgb')
+
+# En la parte de predicción
+# Cargar el modelo entrenado y el escalador
+XGB_model = joblib.load('XGB_model.xgb')
+scaler = joblib.load('scaler.joblib')
+
+# Cargar los bins y etiquetas de edad
+age_bin_edges, age_bin_labels = joblib.load('age_bins.joblib')
+
+# Crear un ejemplo de datos para hacer la predicción manual
+data = pd.DataFrame({
+
+    'Edad': [38],  # Asegúrate de incluir la columna 'Edad' para aplicar los bins
+    'Sexo': [0],
+    'Número cita': [1],
+    'diferencia': [40],
+    'hora': [8],
+    'servicio_Consulta Nutricion primera vez online': [0],
+    'servicio_Consulta Nutricion primera vez presencial': [0],
+    'servicio_Consulta Nutricion subsecuente online': [0],
+    'servicio_Consulta Nutricion subsecuente presencial': [0],
+    'servicio_Consulta Nutrición AC primera vez ': [0],
+    'servicio_Consulta Nutrición AC primera vez online': [1],
+    'servicio_Consulta Nutrición AC subsecuente': [0],
+    'servicio_Consulta Nutrición AC subsecuente online': [0],
+    'servicio_Consulta Pediatria primera vez online': [0],
+    'servicio_Consulta Pediatria primera vez presencial': [0],
+    'servicio_Consulta Pediatria subsecuente online': [0],
+    'servicio_Consulta Pediatria subsecuente presencial': [0],
+    'servicio_Protocolo fertilidad primera vez online': [0],
+    'servicio_Protocolo fertilidad primera vez presencial': [0],
+    'servicio_Protocolo fertilidad subsecuente online': [0],
+    'servicio_Protocolo fertilidad subsecuente presencial': [0],
+    'servicio_Venus Legacy - Abdomen': [0],
+    'servicio_Venus Legacy - Brazo': [0],
+    'servicio_Venus Legacy - Gluteos': [0],
+    'servicio_Venus Legacy - Muslo inferior': [0],
+    'servicio_Venus Legacy - Muslo superior': [0],
+    'servicio_Venus Legacy - Rostro': [0],
+    'día_Friday': [0],
+    'día_Monday': [0],
+    'día_Saturday': [0],
+    'día_Sunday': [0],
+    'día_Thursday': [0],
+    'día_Tuesday': [0],
+    'día_Wednesday': [1],
+    'Edad_bin_0_to_9': [0],
+    'Edad_bin_9_to_18': [1],
+    'Edad_bin_18_to_27': [0],
+    'Edad_bin_27_to_36': [0],
+    'Edad_bin_36_to_45': [0],
+    'Edad_bin_45_to_54': [0],
+    'Edad_bin_54_to_63': [0],
+    'Edad_bin_63_to_72': [0],
+    'Edad_bin_72_to_81': [0],
+    'Edad_bin_81_to_91': [0],
+    'estacion_Invierno': [1],
+    'estacion_Otoño': [0],
+    'estacion_Primavera': [0],
+    'estacion_Verano': [0],
+    'Doctor_ ANA CECILIA VILLARREAL': [0],
+    'Doctor_ SAMANTHA NAVARRO': [0],
+    'Doctor_ VIVIANA RAMÍREZ': [0],
+    'Doctor_ALEXA': [0],
+    'Doctor_CARLA BATANI': [0],
+    'Doctor_CAROLINA ARIZMEDI': [0],
+    'Doctor_ERIKA ELIZONDO': [0],
+    'Doctor_EYLANHI MORALES': [1],
+    'Doctor_KARINA MARTINEZ': [0],
+    'Doctor_MARCELA LACAYO': [0],
+    'Doctor_Multiconsultorio': [0],
+    'hora_sin': [np.sin(2 * np.pi * 9 / 8.0)],
+    'hora_cos': [np.cos(2 * np.pi * 9 / 8.0)],
+    'mes_sin': [np.sin(2 * np.pi * 1 / 12.0)],
+    'mes_cos': [np.cos(2 * np.pi * 1 / 12.0)],
+    'sexo_encoded': [0]
+})
+
+# Aplicar los mismos bins de edad a los datos de predicción
+data['Edad_bin'] = pd.cut(data['Edad'], bins=age_bin_edges, labels=age_bin_labels)
+
+# Eliminar la columna 'Edad' después de crear los bins
+data.drop(columns=['Edad'], inplace=True)
+
+# Asegurarse de que los nombres de las columnas coincidan con los nombres de las características de entrenamiento
+feature_names = X.columns.tolist()
+data = data.reindex(columns=feature_names, fill_value=0)
+
+# Transformar los datos usando el escalador
+X_scaled_manual = scaler.transform(data)
+
+# Realizar la predicción
+prediction = XGB_model.predict(X_scaled_manual)
+prediction_proba = XGB_model.predict_proba(X_scaled_manual)
+
+# Mostrar resultados
+print("Predicción: ", "Asistirá a la cita" if prediction[0] == 1 else "No asistirá a la cita")
+print("Probabilidad de asistir: {:.4f}%".format(prediction_proba[0][1] * 100))
+print("Probabilidad de no asistir: {:.4f}%".format(prediction_proba[0][0] * 100))
+
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, roc_curve, auc
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Predicciones
+y_train_pred = XGB_model.predict(x_train)
+y_test_pred = XGB_model.predict(x_test)
+
+# Métricas para el conjunto de entrenamiento
+train_accuracy = accuracy_score(y_train, y_train_pred)
+train_precision = precision_score(y_train, y_train_pred)
+train_recall = recall_score(y_train, y_train_pred)
+train_f1 = f1_score(y_train, y_train_pred)
+
+# Métricas para el conjunto de prueba
+test_accuracy = accuracy_score(y_test, y_test_pred)
+test_precision = precision_score(y_test, y_test_pred)
+test_recall = recall_score(y_test, y_test_pred)
+test_f1 = f1_score(y_test, y_test_pred)
+
+print("Métricas para el conjunto de entrenamiento:")
+print(f"Accuracy: {train_accuracy:.4f}")
+print(f"Precision: {train_precision:.4f}")
+print(f"Recall: {train_recall:.4f}")
+print(f"F1 Score: {train_f1:.4f}")
+
+print("\nMétricas para el conjunto de prueba:")
+print(f"Accuracy: {test_accuracy:.4f}")
+print(f"Precision: {test_precision:.4f}")
+print(f"Recall: {test_recall:.4f}")
+print(f"F1 Score: {test_f1:.4f}")
+
+# Matriz de confusión
+train_cm = confusion_matrix(y_train, y_train_pred)
+test_cm = confusion_matrix(y_test, y_test_pred)
+
+plt.figure(figsize=(14, 6))
+
+plt.subplot(1, 2, 1)
+sns.heatmap(train_cm, annot=True, fmt='d', cmap='Blues')
+plt.title('Matriz de confusión - Entrenamiento')
+plt.xlabel('Predicción')
+plt.ylabel('Realidad')
+
+plt.subplot(1, 2, 2)
+sns.heatmap(test_cm, annot=True, fmt='d', cmap='Blues')
+plt.title('Matriz de confusión - Prueba')
+plt.xlabel('Predicción')
+plt.ylabel('Realidad')
+
+plt.show()
+
+# Probabilidades de predicción
+y_train_prob = XGB_model.predict_proba(x_train)[:, 1]
+y_test_prob = XGB_model.predict_proba(x_test)[:, 1]
+
+# Curvas ROC
+train_fpr, train_tpr, _ = roc_curve(y_train, y_train_prob)
+test_fpr, test_tpr, _ = roc_curve(y_test, y_test_prob)
+
+# AUC
+train_auc = auc(train_fpr, train_tpr)
+test_auc = auc(test_fpr, test_tpr)
+
+plt.figure(figsize=(10, 6))
+
+plt.plot(train_fpr, train_tpr, label=f'Train AUC = {train_auc:.4f}')
+plt.plot(test_fpr, test_tpr, label=f'Test AUC = {test_auc:.4f}')
+plt.plot([0, 1], [0, 1], 'k--')
+
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('Curvas ROC')
+plt.legend()
+plt.show()
+
+from sklearn.model_selection import learning_curve
+
+train_sizes, train_scores, test_scores = learning_curve(XGB_model, X_scaled, y, cv=3, scoring='accuracy', n_jobs=-1, train_sizes=np.linspace(0.1, 1.0, 10))
+
+train_scores_mean = np.mean(train_scores, axis=1)
+train_scores_std = np.std(train_scores, axis=1)
+test_scores_mean = np.mean(test_scores, axis=1)
+test_scores_std = np.std(test_scores, axis=1)
+
+plt.figure(figsize=(10, 6))
+plt.plot(train_sizes, train_scores_mean, 'o-', color='r', label='Training score')
+plt.plot(train_sizes, test_scores_mean, 'o-', color='g', label='Cross-validation score')
+
+plt.fill_between(train_sizes, train_scores_mean - train_scores_std, train_scores_mean + train_scores_std, alpha=0.1, color='r')
+plt.fill_between(train_sizes, test_scores_mean - test_scores_std, test_scores_mean + test_scores_std, alpha=0.1, color='g')
+
+plt.xlabel('Training examples')
+plt.ylabel('Score')
+plt.title('Curvas de Aprendizaje')
+plt.legend(loc='best')
+plt.show()
+
+db_predict_original = db_predict.copy()
+
+# Paso 2: Aplicar el mismo preprocesamiento que a db
+
+# Crear variable binaria
+db_predict = db_predict[(db_predict['tipo'] == 'Cita finalizada') |
+                        (db_predict['tipo'] == 'Cita creada') |
+                        (db_predict['tipo'] == 'Cita confirmada') |
+                        (db_predict['tipo'] == 'Cita confirmada por paciente') |
+                        (db_predict['tipo'] == 'Cancelar - paciente cancelo') |
+                        (db_predict['tipo'] == 'Cancelar - paciente no llego')]
+
+db_predict['Cita exitosa'] = np.where(db_predict['tipo'].isin(["Cita finalizada",
+                                                               "Cita creada",
+                                                               "Cita confirmada",
+                                                               "Cita confirmada por paciente"]), 1, 0)
+
+# Convertir a formato fecha
+db_predict['start_time'] = pd.to_datetime(db_predict['start_time'], errors='coerce')
+
+# Seleccionar clínica. Dejar comentado en caso de que se use toda la base
+#db_predict = db_predict[db_predict['nombre_clinica'] == "VITALEZA"]
+
+# Extraer fecha, hora y día
+db_predict['mes'] = db_predict['start_time'].dt.month
+db_predict['hora'] = db_predict['start_time'].dt.hour
+db_predict['día'] = db_predict['start_time'].dt.day_name()
+
+# Número de citas
+db_predict = db_predict.sort_values(by=['patient_id', 'start_time'])
+db_predict['Número cita'] = db_predict.groupby('patient_id').cumcount() + 1
+
+# Estaciones del año
+db_predict['estacion'] = db_predict['start_time'].apply(get_season)
+
+# Excluir horas donde casi no hay citas
+db_predict = db_predict[(db_predict['hora'] > 6) & (db_predict['hora'] < 24)]
+
+# Días de diferencia
+db_predict = db_predict[db_predict['date'] != '0000-00-00']
+db_predict = db_predict[db_predict['created'] != '0000-00-00']
+
+db_predict['date'] = pd.to_datetime(db_predict['date'],  errors='coerce')
+db_predict['created'] = pd.to_datetime(db_predict['created'],  errors='coerce')
+
+db_predict = db_predict[db_predict['date'] != '0000-00-00']
+db_predict = db_predict[db_predict['created'] != '0000-00-00']
+
+db_predict['diferencia'] = db_predict['date'] - db_predict['created']
+db_predict['diferencia'] = db_predict['diferencia'].dt.days
+
+# Sexo en binario
+db_predict['Sexo'] = np.where(db_predict['sex'].isin(["m"]), 1, 0)
+
+# Edad en bins
+db_predict['Edad'] = pd.to_numeric(db_predict['Edad'], errors='coerce')
+db_predict = db_predict[db_predict['Edad'] < 100]
+
+# Aplicar los mismos bins de edad a db_predict
+db_predict['Edad_bin'] = pd.cut(db_predict['Edad'], bins=age_bin_edges, labels=age_bin_labels)
+
+
+# Asegúrate de incluir 'asistencia_ponderada' en la lista de columnas de interés
+db_predict = db_predict[['servicio', 'día', 'hora', 'mes', 'Sexo', 'Edad_bin', 'Número cita', 'diferencia', 'estacion', 'Doctor', 'Cita exitosa']]
+
+# Eliminar valores nulos
+#db_predict = db_predict.dropna()
+
+# Convertir variables categóricas a variables dummy
+cols_predict = db_predict.select_dtypes(include=['object', 'category']).columns
+db_predict = pd.get_dummies(db_predict, columns=cols_predict)
+
+# Añadir codificación cíclica para hora y mes
+db_predict['hora_sin'] = np.sin(2 * np.pi * db_predict['hora'] / 24.0)
+db_predict['hora_cos'] = np.cos(2 * np.pi * db_predict['hora'] / 24.0)
+db_predict['mes_sin'] = np.sin(2 * np.pi * db_predict['mes'] / 12.0)
+db_predict['mes_cos'] = np.cos(2 * np.pi * db_predict['mes'] / 12.0)
+
+# Asegurarse de que los nombres de las columnas coincidan con los nombres de las características de entrenamiento
+feature_names = X.columns.tolist()
+db_predict = db_predict.reindex(columns=feature_names, fill_value=0)
+
+# Paso 3: Escalar los datos de db_predict
+scaler = RobustScaler()
+X_scaled_predict = scaler.fit_transform(db_predict)
+
+# Paso 4: Hacer las predicciones utilizando el modelo entrenado
+predictions = XGB_model.predict(X_scaled_predict)
+predictions_proba = XGB_model.predict_proba(X_scaled_predict)
+
+# Crear un DataFrame con las predicciones y las probabilidades
+predictions_df = pd.DataFrame({
+    'Predicción': predictions,
+    'Probabilidad de no asistir': predictions_proba[:, 0],
+    'Probabilidad de asistir': predictions_proba[:, 1]
+}, index=db_predict.index)
+
+# Crear variable binaria
+db_predict_original = db_predict_original[(db_predict_original['tipo'] == 'Cita finalizada') |
+                        (db_predict_original['tipo'] == 'Cita creada') |
+                        (db_predict_original['tipo'] == 'Cita confirmada') |
+                        (db_predict_original['tipo'] == 'Cita confirmada por paciente') |
+                        (db_predict_original['tipo'] == 'Cancelar - paciente cancelo') |
+                        (db_predict_original['tipo'] == 'Cancelar - paciente no llego')]
+
+db_predict_original['Cita exitosa'] = np.where(db_predict_original['tipo'].isin(["Cita finalizada",
+                                                               "Cita creada",
+                                                               "Cita confirmada",
+                                                               "Cita confirmada por paciente"]), 1, 0)
+
+# Paso 5: Agregar las predicciones y sus probabilidades al DataFrame original de db_predict
+db_predict_original = db_predict_original.join(predictions_df, how='left')
+
+# Mostrar los resultados
+print(db_predict_original.head())
+
+# Guardar el DataFrame con las predicciones
+db_predict_original.to_csv('/content/drive/My Drive/bases/db_predict_with_predictions.csv', index=False)
+
